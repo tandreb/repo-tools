@@ -50,6 +50,9 @@ class RunSummary:
     manifest_url: str
     manifest_branch: str
     projects_total: int = 0
+    # Every project the manifest resolved to, hit or not. Without this, a run that finds nothing
+    # gives no way to tell whether the expected repo was even searched, and under which URL.
+    projects: list[ProjectRef] = field(default_factory=list)
     hits: list[BranchResult] = field(default_factory=list)
     errors: list[RepoError] = field(default_factory=list)
     # Parts of the manifest that could not be resolved (e.g. an unreachable submanifest), meaning

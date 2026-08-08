@@ -183,6 +183,7 @@ async def run(args: argparse.Namespace) -> RunSummary:
         manifest_url=location.url,
         manifest_branch=location.branch,
         projects_total=len(projects),
+        projects=projects,
         warnings=manifest_warnings,
     )
 

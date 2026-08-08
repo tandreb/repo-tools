@@ -102,6 +102,17 @@ def build_json_payload(summary: RunSummary) -> dict:
             }
             for hit in sorted(summary.hits, key=lambda h: h.project.path)
         ],
+        "projects": [
+            {
+                "path": p.path,
+                "name": p.name,
+                "fetch_url": p.fetch_url,
+                "revision": p.revision,
+                "groups": list(p.groups),
+                "source_manifest": p.source_manifest,
+            }
+            for p in sorted(summary.projects, key=lambda p: p.path)
+        ],
         "errors": [
             {
                 "path": err.project.path,
@@ -128,6 +139,16 @@ def print_summary_footer(summary: RunSummary, file=None) -> None:
         f"{len(summary.errors)} unreachable/failed.",
         file=file,
     )
+    if not summary.hits and summary.projects:
+        # Nothing found while the manifest resolved fine means the searched set is the thing to
+        # question, so point at where that set can be inspected instead of leaving a bare zero.
+        print(
+            f"  All {len(summary.projects)} project(s) were reachable and none had this branch.\n"
+            "  If you expect a specific repo to match, check that it is in the searched set and\n"
+            "  that its URL is the one you see the branch on: --list-projects (or the \"projects\"\n"
+            "  array in the JSON output).",
+            file=file,
+        )
     if summary.warnings:
         # The project list itself is incomplete here, so say that plainly rather than letting the
         # counts above read as if the whole manifest had been searched.
