@@ -101,6 +101,11 @@ def _resolve_manifest_location(args: argparse.Namespace) -> tuple[str, str, str,
         manifest_branch = manifest_branch or info.manifest_branch
         manifest_file = manifest_file or info.manifest_file
         local_manifest_dir = local_manifest_dir or info.local_manifest_dir
+        print(
+            f"Detected from --repo-dir: manifest-url={manifest_url} manifest-branch={manifest_branch} "
+            f"manifest-file={manifest_file} local-manifest-dir={local_manifest_dir}",
+            file=sys.stderr,
+        )
 
     if not manifest_url:
         raise RepoWorkspaceError("either --manifest-url or --repo-dir is required")

@@ -75,7 +75,6 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
     branch = merge_ref.removeprefix("refs/heads/") if merge_ref else local_branch
 
     manifest_link = repo_dir / "manifest.xml"
-    manifest_file = "default.xml"
     if manifest_link.is_symlink():
         try:
             target = manifest_link.resolve(strict=True)
@@ -88,6 +87,20 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
             manifest_file = target.relative_to(manifests_dir.resolve(strict=True)).as_posix()
         except ValueError:
             manifest_file = target.name
+    elif manifest_link.is_file():
+        # Some repo-tool variants write manifest.xml as a plain copy instead of a symlink, which
+        # loses the information we need (its path within the manifest repo). We can't safely guess
+        # a filename here -- silently defaulting to "default.xml" produced confusing fetch failures
+        # when that guess was wrong.
+        raise RepoWorkspaceError(
+            f"{manifest_link} is a regular file, not a symlink, so the root manifest file name/path "
+            "can't be determined automatically; pass --manifest-file explicitly (and --manifest-branch "
+            "if it also isn't the correct default)"
+        )
+    else:
+        raise RepoWorkspaceError(
+            f"{manifest_link} not found; pass --manifest-file explicitly to specify the root manifest file"
+        )
 
     local_manifests = repo_dir / "local_manifests"
     local_manifest_dir = str(local_manifests) if local_manifests.is_dir() else None
