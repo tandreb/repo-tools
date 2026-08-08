@@ -84,7 +84,7 @@ Netzwerkzugriffe, sondern funktioniert auch dann, wenn dessen Repository selbst 
 erreichbar ist.
 
 Relative Fetch-URLs (`fetch=".."`, die AOSP-Konvention) werden gegen die Manifest-URL
-aufgelöst.
+aufgelöst. `<remove-project>` selektiert wie bei `repo` über `name` **und/oder** `path`.
 
 ### Unerreichbare Submanifeste
 

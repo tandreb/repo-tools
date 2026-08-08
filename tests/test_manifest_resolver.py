@@ -266,6 +266,64 @@ class UnreachableSubmanifestTest(unittest.TestCase):
             _resolve({(ROOT_URL, "main", "default.xml"): root})
 
 
+class RemoveProjectTest(unittest.TestCase):
+    """repo accepts "name and/or path" here; requiring name rejected valid manifests."""
+
+    BASE = """
+      <remote name="origin" fetch="https://example.com/base"/>
+      <default remote="origin" revision="main"/>
+      <project name="proj-a" path="a"/>
+      <project name="proj-b" path="b"/>
+    """
+
+    def _paths(self, removal: str) -> list[str]:
+        root = f"<manifest>{self.BASE}{removal}</manifest>".encode()
+        return sorted(p.path for p in _resolve({(ROOT_URL, "main", "default.xml"): root}))
+
+    def test_remove_by_path_alone(self):
+        self.assertEqual(self._paths('<remove-project path="a"/>'), ["b"])
+
+    def test_remove_by_name_alone(self):
+        self.assertEqual(self._paths('<remove-project name="proj-b"/>'), ["a"])
+
+    def test_remove_by_name_and_path(self):
+        self.assertEqual(self._paths('<remove-project name="proj-a" path="a"/>'), ["b"])
+
+    def test_mismatched_name_and_path_removes_nothing(self):
+        self.assertEqual(self._paths('<remove-project name="proj-a" path="b"/>'), ["a", "b"])
+
+    def test_removing_a_missing_project_is_tolerated(self):
+        self.assertEqual(self._paths('<remove-project name="not-here"/>'), ["a", "b"])
+
+    def test_without_name_or_path_raises(self):
+        with self.assertRaises(ManifestResolutionError):
+            self._paths("<remove-project/>")
+
+    def test_path_inside_submanifest_is_relative_to_that_submanifest(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <submanifest name="vendor" path="vendor"/>
+        </manifest>
+        """
+        sub = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <project name="lib-x" path="libx"/>
+          <project name="lib-y" path="liby"/>
+          <remove-project path="libx"/>
+        </manifest>
+        """
+        fetcher = _FakeFileFetcher({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "vendor", "default.xml"): sub,
+        })
+        projects = resolve_manifest(ROOT_URL, "main", fetcher, strict=True)
+        self.assertEqual([p.path for p in projects], ["vendor/liby"])
+
+
 class RelativeFetchUrlTest(unittest.TestCase):
     """`fetch=".."` is the AOSP convention and only means anything relative to the manifest URL."""
 

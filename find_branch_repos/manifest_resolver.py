@@ -156,10 +156,7 @@ def _process_manifest(
             _add_project(elem, scope=scope, path_prefix=path_prefix, source_label=source_label, context=context)
 
         elif elem.tag == "remove-project":
-            name = _require(elem, "name", context)
-            for path, proj in list(scope.projects.items()):
-                if proj.name == name:
-                    del scope.projects[path]
+            _remove_project(elem, scope=scope, path_prefix=path_prefix, context=context)
 
         elif elem.tag == "include":
             include_name = _require(elem, "name", context)
@@ -213,6 +210,29 @@ def _add_project(elem: ET.Element, *, scope: _Scope, path_prefix: str, source_la
         groups=groups,
         source_manifest=source_label,
     )
+
+
+def _remove_project(elem: ET.Element, *, scope: _Scope, path_prefix: str, context: str) -> None:
+    """Drop projects matched by <remove-project>, which selects by name and/or path.
+
+    repo accepts either attribute ("remove-project must have name and/or path"); requiring
+    `name` rejected perfectly valid manifests that remove a project by path alone.
+    """
+    name = elem.attrib.get("name")
+    path = elem.attrib.get("path")
+    if not name and not path:
+        raise ManifestResolutionError(f"<remove-project> in {context} needs a 'name' and/or a 'path'")
+
+    target_path = _join_path(path_prefix, path) if path else None
+    for project_path, project in list(scope.projects.items()):
+        if target_path is not None and project_path != target_path:
+            continue
+        if name and project.name != name:
+            continue
+        del scope.projects[project_path]
+    # A remove-project matching nothing is left alone on purpose: repo errors out unless
+    # optional="true", but for a read-only report that would only turn a harmless manifest
+    # quirk into a lost repository list.
 
 
 def _process_submanifest(
@@ -362,7 +382,4 @@ def _apply_local_manifests(directory: Path, scope: _Scope) -> None:
             elif elem.tag == "project":
                 _add_project(elem, scope=scope, path_prefix="", source_label=context, context=context)
             elif elem.tag == "remove-project":
-                name = _require(elem, "name", context)
-                for path, proj in list(scope.projects.items()):
-                    if proj.name == name:
-                        del scope.projects[path]
+                _remove_project(elem, scope=scope, path_prefix="", context=context)
