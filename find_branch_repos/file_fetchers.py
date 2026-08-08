@@ -87,7 +87,14 @@ class GitHubApiFileFetcher:
         headers = {"Accept": "application/vnd.github.raw+json"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
-        raw = _http_get(url, headers=headers)
+        try:
+            raw = _http_get(url, headers=headers)
+        except FileFetchError as exc:
+            # GitHub answers 404 rather than 403 for repositories the caller cannot see, so an
+            # unauthenticated 404 says nothing about whether the repo actually exists.
+            if not self.token and "HTTP 404" in str(exc):
+                raise FileFetchError(f"{exc} (no GitHub token set, so private repos also look like 404)") from exc
+            raise
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:

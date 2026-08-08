@@ -146,12 +146,13 @@ class SubmanifestTest(unittest.TestCase):
         libx = next(p for p in projects if p.path == "vendor/libx")
         self.assertEqual(libx.fetch_url, "https://vendor.example.com/base/lib-x")
 
-    def test_revision_falls_back_to_default_when_submanifest_and_remote_omit_it(self):
+    def test_revision_falls_back_to_submanifest_name(self):
+        """repo uses `revision or name` here -- not the remote's or the <default>'s revision."""
         root = b"""
         <manifest>
           <remote name="origin" fetch="https://example.com/base"/>
           <default remote="origin" revision="release-42"/>
-          <submanifest name="vendor" project="vendor-manifest" path="vendor"/>
+          <submanifest name="vendor-branch" project="vendor-manifest" path="vendor"/>
         </manifest>
         """
         sub = b"""
@@ -163,10 +164,67 @@ class SubmanifestTest(unittest.TestCase):
         """
         fetcher = _FakeFileFetcher({
             (ROOT_URL, "main", "default.xml"): root,
-            ("https://example.com/base/vendor-manifest", "release-42", "default.xml"): sub,
+            ("https://example.com/base/vendor-manifest", "vendor-branch", "default.xml"): sub,
         })
         projects = resolve_manifest(ROOT_URL, "main", fetcher, strict=True)
         self.assertEqual(sorted(p.path for p in projects), ["vendor/libx"])
+
+    def test_without_project_the_submanifest_lives_in_the_parent_manifest_repo(self):
+        """The bug that made every submanifest 404: repo uses the parent manifest's own URL when
+        no `project` is given, rather than deriving one from the remote and the submanifest name."""
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <submanifest name="feature-x" path="featx"/>
+        </manifest>
+        """
+        sub = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <project name="lib-x" path="libx"/>
+        </manifest>
+        """
+        fetcher = _FakeFileFetcher({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "feature-x", "default.xml"): sub,  # same repo, submanifest's own revision
+        })
+        projects = resolve_manifest(ROOT_URL, "main", fetcher, strict=True)
+        self.assertEqual([p.path for p in projects], ["featx/libx"])
+
+    def test_remote_without_project_is_rejected(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <submanifest name="vendor" remote="origin"/>
+        </manifest>
+        """
+        with self.assertRaises(ManifestResolutionError):
+            _resolve({(ROOT_URL, "main", "default.xml"): root})
+
+    def test_path_defaults_to_last_component_of_revision(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <submanifest name="vendor" revision="releases/r42"/>
+        </manifest>
+        """
+        sub = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <project name="lib-x" path="libx"/>
+        </manifest>
+        """
+        fetcher = _FakeFileFetcher({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "releases/r42", "default.xml"): sub,
+        })
+        projects = resolve_manifest(ROOT_URL, "main", fetcher, strict=True)
+        self.assertEqual([p.path for p in projects], ["r42/libx"])
 
 
 class UnreachableSubmanifestTest(unittest.TestCase):
@@ -206,6 +264,82 @@ class UnreachableSubmanifestTest(unittest.TestCase):
         """
         with self.assertRaises(ManifestResolutionError):
             _resolve({(ROOT_URL, "main", "default.xml"): root})
+
+
+class RelativeFetchUrlTest(unittest.TestCase):
+    """`fetch=".."` is the AOSP convention and only means anything relative to the manifest URL."""
+
+    def test_relative_fetch_is_resolved_against_manifest_url(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch=".."/>
+          <default remote="origin" revision="main"/>
+          <project name="proj-a" path="a"/>
+        </manifest>
+        """
+        projects = _resolve({(ROOT_URL, "main", "default.xml"): root})
+        # Same shape as AOSP: manifest at <host>/platform/manifest with fetch=".." puts projects
+        # at <host>/<project name>. Here ROOT_URL is https://example.com/base/manifest.
+        self.assertEqual(projects[0].fetch_url, "https://example.com/proj-a")
+
+    def test_absolute_fetch_is_left_alone(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://other.example.com/x"/>
+          <default remote="origin" revision="main"/>
+          <project name="proj-a" path="a"/>
+        </manifest>
+        """
+        projects = _resolve({(ROOT_URL, "main", "default.xml"): root})
+        self.assertEqual(projects[0].fetch_url, "https://other.example.com/x/proj-a")
+
+
+class LocallyCheckedOutSubmanifestTest(unittest.TestCase):
+    """A submanifest already synced into the workspace needs no network access at all."""
+
+    ROOT = b"""
+    <manifest>
+      <remote name="origin" fetch="https://example.com/base"/>
+      <default remote="origin" revision="main"/>
+      <submanifest name="vendor" path="vendor"/>
+    </manifest>
+    """
+    SUB = b"""
+    <manifest>
+      <remote name="vorigin" fetch="https://vendor.example.com/base"/>
+      <default remote="vorigin" revision="main"/>
+      <project name="lib-x" path="libx"/>
+    </manifest>
+    """
+
+    def test_local_checkout_is_preferred_over_fetching(self):
+        fetcher = _FakeFileFetcher({(ROOT_URL, "main", "default.xml"): self.ROOT})  # sub not fetchable
+        projects = resolve_manifest(
+            ROOT_URL, "main", fetcher, strict=True,
+            submanifest_lookup=lambda path, name: self.SUB if (path, name) == ("vendor", "default.xml") else None,
+        )
+        self.assertEqual([p.path for p in projects], ["vendor/libx"])
+        self.assertNotIn(("https://example.com/base", "vendor", "default.xml"), fetcher.calls)
+
+    def test_includes_inside_a_local_submanifest_are_also_read_locally(self):
+        root_sub = b'<manifest><include name="more.xml"/></manifest>'
+        files = {("vendor", "default.xml"): root_sub, ("vendor", "more.xml"): self.SUB}
+        fetcher = _FakeFileFetcher({(ROOT_URL, "main", "default.xml"): self.ROOT})
+        projects = resolve_manifest(
+            ROOT_URL, "main", fetcher, strict=True,
+            submanifest_lookup=lambda path, name: files.get((path, name)),
+        )
+        self.assertEqual([p.path for p in projects], ["vendor/libx"])
+
+    def test_falls_back_to_fetching_when_not_checked_out(self):
+        fetcher = _FakeFileFetcher({
+            (ROOT_URL, "main", "default.xml"): self.ROOT,
+            (ROOT_URL, "vendor", "default.xml"): self.SUB,
+        })
+        projects = resolve_manifest(
+            ROOT_URL, "main", fetcher, strict=True, submanifest_lookup=lambda path, name: None
+        )
+        self.assertEqual([p.path for p in projects], ["vendor/libx"])
 
 
 class LocalManifestTest(unittest.TestCase):

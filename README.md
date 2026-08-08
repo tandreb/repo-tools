@@ -68,6 +68,24 @@ einem Hinweis ab, statt zu raten; die betroffenen Werte können dann per
 | `--strict-manifest` | Bricht ab, wenn ein `<submanifest>` nicht auflösbar ist (statt es mit Warnung zu überspringen) |
 | `--verbose` | Debug-Logging |
 
+### Submanifeste
+
+Die Auflösung folgt der Semantik von `repo` selbst (`_XmlSubmanifest.ToSubmanifestSpec`):
+
+- **Ohne `project`-Attribut** liegt ein Submanifest im **Manifest-Repo des Elternteils** selbst
+  (typischerweise auf einem anderen Branch) — nicht unter `<remote fetch>/<name>`.
+- Die Revision fällt auf den **Namen des Submanifests** zurück, nicht auf `<default revision>`.
+- Der Checkout-Pfad ist `path`, sonst die letzte Komponente der Revision.
+- `remote` ohne `project` ist ungültig und wird abgelehnt.
+
+Ist ein Submanifest im Workspace bereits ausgecheckt (`.repo/submanifests/<pfad>/manifests/`),
+wird es von dort gelesen — inklusive seiner eigenen `<include>`s. Das spart nicht nur
+Netzwerkzugriffe, sondern funktioniert auch dann, wenn dessen Repository selbst nicht
+erreichbar ist.
+
+Relative Fetch-URLs (`fetch=".."`, die AOSP-Konvention) werden gegen die Manifest-URL
+aufgelöst.
+
 ### Unerreichbare Submanifeste
 
 Ein `<submanifest>` liegt in einem eigenen Repository, das privat, stillgelegt oder mit den

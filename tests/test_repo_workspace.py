@@ -12,7 +12,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from find_branch_repos.repo_workspace import RepoWorkspaceError, resolve_from_repo_dir
+from find_branch_repos.repo_workspace import (
+    RepoWorkspaceError,
+    make_submanifest_lookup,
+    resolve_from_repo_dir,
+)
 
 GENERATED_STUB = """<?xml version="1.0" encoding="UTF-8"?>
 <!--
@@ -150,6 +154,39 @@ class WorkspaceLayoutTest(RepoWorkspaceTestBase):
         with self.assertRaises(RepoWorkspaceError) as ctx:
             resolve_from_repo_dir(bare)
         self.assertIn("repo init", str(ctx.exception))
+
+
+class SubmanifestLookupTest(RepoWorkspaceTestBase):
+    """`repo sync` puts submanifest checkouts at .repo/submanifests/<path>/manifests/."""
+
+    def test_reads_checked_out_submanifest(self):
+        checkout = self.repo_dir / "submanifests" / "vendor" / "manifests"
+        checkout.mkdir(parents=True)
+        (checkout / "default.xml").write_bytes(b"<manifest/>")
+
+        lookup = make_submanifest_lookup(self.repo_dir)
+        self.assertEqual(lookup("vendor", "default.xml"), b"<manifest/>")
+
+    def test_returns_none_when_not_checked_out(self):
+        lookup = make_submanifest_lookup(self.repo_dir)
+        self.assertIsNone(lookup("vendor", "default.xml"))
+        self.assertIsNone(lookup("", ""))
+
+    def test_nested_submanifest_path(self):
+        checkout = self.repo_dir / "submanifests" / "outer" / "inner" / "manifests"
+        checkout.mkdir(parents=True)
+        (checkout / "sub.xml").write_bytes(b"<manifest/>")
+
+        lookup = make_submanifest_lookup(self.repo_dir)
+        self.assertEqual(lookup("outer/inner", "sub.xml"), b"<manifest/>")
+
+    def test_does_not_escape_the_submanifest_checkout(self):
+        checkout = self.repo_dir / "submanifests" / "vendor" / "manifests"
+        checkout.mkdir(parents=True)
+        (self.repo_dir / "secret.xml").write_bytes(b"<manifest/>")
+
+        lookup = make_submanifest_lookup(self.repo_dir)
+        self.assertIsNone(lookup("vendor", "../../../secret.xml"))
 
 
 if __name__ == "__main__":

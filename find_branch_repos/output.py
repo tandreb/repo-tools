@@ -13,6 +13,16 @@ _COLUMNS = ("path", "fetch_url", "sha", "author", "date", "subject")
 _HEADERS = ("Path", "Remote URL", "SHA", "Author", "Date", "Subject")
 
 
+def _shorten(text: str, limit: int = 800) -> str:
+    """Flatten and cap a message for console display; git's stderr is multi-line and verbose.
+
+    Only the console output is shortened -- the JSON keeps the full text, since that is what
+    anyone diagnosing an unreachable repository actually needs.
+    """
+    collapsed = " ".join(text.split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
+
+
 def render_table(summary: RunSummary) -> str:
     if not summary.hits:
         return "No matching repositories found."
@@ -104,7 +114,7 @@ def print_summary_footer(summary: RunSummary, file=None) -> None:
             file=file,
         )
         for warning in summary.warnings:
-            print(f"  - {warning}", file=file)
+            print(f"  - {_shorten(warning)}", file=file)
         print(
             "  Hint: private repos may need --github-token/--gitlab-token or git credentials. "
             "Use --strict-manifest to treat this as a hard error.",

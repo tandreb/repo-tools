@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import logging
 import posixpath
+import urllib.parse
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .file_fetchers import FileFetchError, FileFetcherChain
@@ -44,6 +46,9 @@ class _Scope:
     projects: dict[str, ProjectRef] = field(default_factory=dict)  # keyed by local path
 
 
+SubmanifestLookup = Callable[[str, str], bytes | None]
+
+
 @dataclass
 class _Context:
     """Resolution-wide state, shared across the nested scopes a submanifest creates."""
@@ -51,6 +56,23 @@ class _Context:
     file_fetcher: FileFetcherChain
     strict: bool = False
     warnings: list[str] = field(default_factory=list)
+    # Optional (submanifest_path, filename) -> content lookup for submanifests the local
+    # workspace has already checked out, avoiding a network round trip for them entirely.
+    submanifest_lookup: SubmanifestLookup | None = None
+
+
+@dataclass
+class _LocalSubmanifestFetcher:
+    """FileFetcherChain stand-in that serves a checked-out submanifest's files from disk."""
+
+    lookup: SubmanifestLookup
+    submanifest_path: str
+
+    def fetch(self, repo_url: str, ref: str, path: str) -> tuple[bytes, str]:
+        content = self.lookup(self.submanifest_path, path)
+        if content is None:
+            raise FileFetchError(f"{path} not found in locally checked out submanifest {self.submanifest_path}")
+        return content, "local-submanifest"
 
 
 def _require(elem: ET.Element, attr: str, context: str) -> str:
@@ -68,10 +90,20 @@ def _resolve_revision(project_revision: str | None, default_revision: str | None
     return project_revision or default_revision or remote_revision or "HEAD"
 
 
-def _one_line(text: str, limit: int = 300) -> str:
-    """Flatten a message for single-line display; git's stderr is multi-line and very verbose."""
-    collapsed = " ".join(text.split())
-    return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
+def _resolve_fetch_url(fetch_url: str, manifest_url: str) -> str:
+    """Resolve a <remote fetch=...> against the manifest repo URL, mirroring repo's own logic.
+
+    Manifests routinely use relative fetch URLs (`fetch=".."` is the AOSP convention), which only
+    mean anything relative to the URL the manifest itself was fetched from.
+    """
+    if not fetch_url:
+        return ""
+    # urljoin needs a scheme on the base, which local-path manifest URLs don't have; repo works
+    # around this with a placeholder scheme, and this mirrors that so both behave identically.
+    if manifest_url.find(":") != manifest_url.find("/") - 1:
+        joined = urllib.parse.urljoin("gopher://" + manifest_url, fetch_url)
+        return joined.removeprefix("gopher://")
+    return urllib.parse.urljoin(manifest_url, fetch_url)
 
 
 def _join_path(prefix: str, path: str) -> str:
@@ -111,7 +143,11 @@ def _process_manifest(
     for elem in root:
         if elem.tag == "remote":
             name = _require(elem, "name", context)
-            scope.remotes[name] = _Remote(name=name, fetch=_require(elem, "fetch", context), revision=elem.attrib.get("revision"))
+            scope.remotes[name] = _Remote(
+                name=name,
+                fetch=_resolve_fetch_url(_require(elem, "fetch", context), repo_url),
+                revision=elem.attrib.get("revision"),
+            )
 
         elif elem.tag == "default":
             scope.default = _Default(remote=elem.attrib.get("remote"), revision=elem.attrib.get("revision"))
@@ -141,7 +177,15 @@ def _process_manifest(
             )
 
         elif elem.tag == "submanifest":
-            _process_submanifest(elem, scope=scope, ctx=ctx, visited=visited, path_prefix=path_prefix, context=context)
+            _process_submanifest(
+                elem,
+                scope=scope,
+                ctx=ctx,
+                visited=visited,
+                path_prefix=path_prefix,
+                parent_manifest_url=repo_url,
+                context=context,
+            )
 
         # other tags (<copyfile>, <linkfile>, <extend-project>, <repo-hooks>, ...) don't affect
         # which repos/branches exist and are intentionally ignored
@@ -178,26 +222,49 @@ def _process_submanifest(
     ctx: _Context,
     visited: frozenset[tuple[str, str, str]],
     path_prefix: str,
+    parent_manifest_url: str,
     context: str,
 ) -> None:
     name = _require(elem, "name", context)
-    remote_alias = elem.attrib.get("remote") or scope.default.remote
-    remote = scope.remotes.get(remote_alias)
-    if remote is None:
-        raise ManifestResolutionError(f"submanifest '{name}' in {context} references unknown remote '{remote_alias}'")
+    project_name = elem.attrib.get("project")
+    remote_alias = elem.attrib.get("remote")
+    if remote_alias and not project_name:
+        raise ManifestResolutionError(f"submanifest '{name}' in {context} sets 'remote' but not 'project'")
 
-    project_name = elem.attrib.get("project", name)
-    sub_repo_url = _join_fetch_url(remote.fetch, project_name)
-    # Per the manifest format, a submanifest's revision falls back to the remote's, then the
-    # default's -- omitting the default made us request a ref that need not exist.
-    sub_ref = elem.attrib.get("revision") or remote.revision or scope.default.revision or "HEAD"
+    if project_name:
+        alias = remote_alias or scope.default.remote
+        remote = scope.remotes.get(alias)
+        if remote is None:
+            raise ManifestResolutionError(f"submanifest '{name}' in {context} references unknown remote '{alias}'")
+        sub_repo_url = _join_fetch_url(remote.fetch, project_name)
+    else:
+        # Without a 'project', the submanifest lives in the *parent manifest's own repository*
+        # -- deriving a URL from the remote's fetch base and the submanifest name instead
+        # invents a repository that does not exist.
+        sub_repo_url = parent_manifest_url
+
+    # A submanifest's revision falls back to its name, not to the remote's or default's revision.
+    sub_ref = elem.attrib.get("revision") or name
     manifest_name = elem.attrib.get("manifest-name", "default.xml")
-    sub_path_prefix = _join_path(path_prefix, elem.attrib.get("path", name))
+    sub_path_prefix = _join_path(path_prefix, elem.attrib.get("path") or sub_ref.split("/")[-1])
     sub_label = f"submanifest:{name}"
 
     sub_scope = _Scope()
+    sub_ctx = ctx
     try:
-        sub_root = _fetch_xml(ctx.file_fetcher, sub_repo_url, sub_ref, manifest_name, sub_label)
+        local_xml = ctx.submanifest_lookup(sub_path_prefix, manifest_name) if ctx.submanifest_lookup else None
+        if local_xml is None:
+            sub_root = _fetch_xml(ctx.file_fetcher, sub_repo_url, sub_ref, manifest_name, sub_label)
+        else:
+            # The workspace already has this submanifest checked out, so read it from there and
+            # resolve its own <include>s from the same local checkout instead of over the network.
+            logger.debug("using locally checked out submanifest '%s' for %s", name, sub_path_prefix)
+            try:
+                sub_root = ET.fromstring(local_xml)
+            except ET.ParseError as exc:
+                raise ManifestResolutionError(f"invalid XML in local submanifest '{name}' ({manifest_name}): {exc}") from exc
+            sub_ctx = replace(ctx, file_fetcher=_LocalSubmanifestFetcher(ctx.submanifest_lookup, sub_path_prefix))
+
         _process_manifest(
             sub_root,
             repo_url=sub_repo_url,
@@ -206,7 +273,7 @@ def _process_submanifest(
             path_prefix=sub_path_prefix,
             visited=visited,
             scope=sub_scope,
-            ctx=ctx,
+            ctx=sub_ctx,
             source_label=sub_label,
         )
     except ManifestResolutionError as exc:
@@ -217,7 +284,8 @@ def _process_submanifest(
             raise
         # Reported through ctx.warnings (which the CLI prints prominently), so only log at debug
         # level here -- logging it again at warning level just duplicates it on the console.
-        ctx.warnings.append(f"submanifest '{name}' ({sub_repo_url}@{sub_ref}): {_one_line(str(exc))}")
+        # The full message is kept; shortening for the console is the caller's job.
+        ctx.warnings.append(f"submanifest '{name}' ({sub_repo_url}@{sub_ref}): {exc}")
         logger.debug("skipping submanifest '%s' (%s@%s): %s", name, sub_repo_url, sub_ref, exc)
         return
     scope.projects.update(sub_scope.projects)
@@ -232,6 +300,7 @@ def resolve_manifest(
     root_xml: bytes | None = None,
     strict: bool = False,
     warnings: list[str] | None = None,
+    submanifest_lookup: SubmanifestLookup | None = None,
 ) -> list[ProjectRef]:
     """Resolve a manifest tree into a flat project list.
 
@@ -244,7 +313,12 @@ def resolve_manifest(
     make it abort instead. <include> failures are always fatal: an include lives in the manifest
     repo we could already read, so failing to read it means the manifest itself is inconsistent.
     """
-    ctx = _Context(file_fetcher=file_fetcher, strict=strict, warnings=warnings if warnings is not None else [])
+    ctx = _Context(
+        file_fetcher=file_fetcher,
+        strict=strict,
+        warnings=warnings if warnings is not None else [],
+        submanifest_lookup=submanifest_lookup,
+    )
     scope = _Scope()
     if root_xml is None:
         root = _fetch_xml(file_fetcher, manifest_repo_url, manifest_ref, root_file, "root")

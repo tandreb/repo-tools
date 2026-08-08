@@ -8,6 +8,7 @@ target) -- never repo *content*, and nothing is fetched, cloned, or modified.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,7 @@ class RepoWorkspaceInfo:
     manifest_branch: str
     manifest_file: str
     local_manifest_dir: str | None
+    repo_dir: str = ""
     # Content of a locally generated .repo/manifest.xml, when that file is a real file rather
     # than a symlink into .repo/manifests/ (see resolve_from_repo_dir). It is used as the root
     # manifest directly; its <include>s still resolve against the remote manifest repo.
@@ -121,4 +123,29 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
         manifest_file=manifest_file,
         local_manifest_dir=local_manifest_dir,
         root_manifest_xml=root_manifest_xml,
+        repo_dir=str(repo_dir),
     )
+
+
+def make_submanifest_lookup(repo_dir: str | Path) -> Callable[[str, str], bytes | None]:
+    """Serve submanifest files from the workspace's own checkouts instead of over the network.
+
+    `repo sync` stores each submanifest's manifest repo at
+    .repo/submanifests/<submanifest path>/manifests/, so when a submanifest is already present
+    locally there is no need to reach its (possibly private or unreachable) repository at all.
+    Returns None for anything not checked out, letting the caller fall back to fetching.
+    """
+    base = Path(repo_dir) / "submanifests"
+
+    def lookup(submanifest_path: str, filename: str) -> bytes | None:
+        candidate = base / submanifest_path / "manifests" / filename
+        try:
+            if not candidate.is_file():
+                return None
+            # Guard against a filename escaping the submanifest checkout via "..".
+            candidate.resolve(strict=True).relative_to((base / submanifest_path / "manifests").resolve(strict=True))
+            return candidate.read_bytes()
+        except (OSError, ValueError):
+            return None
+
+    return lookup

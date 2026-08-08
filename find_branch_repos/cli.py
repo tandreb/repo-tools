@@ -14,7 +14,7 @@ from .branch_checker import InvalidBranchNameError, check_branch_on_all
 from .manifest_resolver import ManifestResolutionError, resolve_manifest
 from .models import BranchResult, ProjectRef, RepoError, RunSummary
 from .output import print_summary_footer, render_table, write_json
-from .repo_workspace import RepoWorkspaceError, resolve_from_repo_dir
+from .repo_workspace import RepoWorkspaceError, make_submanifest_lookup, resolve_from_repo_dir
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,7 @@ class _ManifestLocation:
     file: str
     local_manifest_dir: str | None
     root_xml: bytes | None = None
+    submanifest_lookup: object | None = None
 
 
 def _resolve_manifest_location(args: argparse.Namespace) -> _ManifestLocation:
@@ -111,12 +112,14 @@ def _resolve_manifest_location(args: argparse.Namespace) -> _ManifestLocation:
     manifest_file = args.manifest_file
     local_manifest_dir = args.local_manifest_dir
     root_xml: bytes | None = None
+    submanifest_lookup = None
 
     if args.repo_dir:
         info = resolve_from_repo_dir(args.repo_dir)
         manifest_url = manifest_url or info.manifest_url
         manifest_branch = manifest_branch or info.manifest_branch
         local_manifest_dir = local_manifest_dir or info.local_manifest_dir
+        submanifest_lookup = make_submanifest_lookup(info.repo_dir)
         if not manifest_file:
             manifest_file = info.manifest_file
             root_xml = info.root_manifest_xml
@@ -134,6 +137,7 @@ def _resolve_manifest_location(args: argparse.Namespace) -> _ManifestLocation:
         file=manifest_file or "default.xml",
         local_manifest_dir=local_manifest_dir,
         root_xml=root_xml,
+        submanifest_lookup=submanifest_lookup,
     )
 
 
@@ -156,6 +160,7 @@ async def run(args: argparse.Namespace) -> RunSummary:
         root_xml=location.root_xml,
         strict=args.strict_manifest,
         warnings=manifest_warnings,
+        submanifest_lookup=location.submanifest_lookup,
     )
     projects = _dedupe(projects)
 
