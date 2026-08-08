@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import RunSummary
+from .models import ProjectRef, RunSummary
 
 _COLUMNS = ("path", "fetch_url", "sha", "author", "date", "subject")
 _HEADERS = ("Path", "Remote URL", "SHA", "Author", "Date", "Subject")
@@ -48,6 +48,29 @@ def render_table(summary: RunSummary) -> str:
         return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
 
     lines = [fmt_row(_HEADERS), "  ".join("-" * w for w in widths)]
+    lines.extend(fmt_row(row) for row in rows)
+    return "\n".join(lines)
+
+
+def render_project_table(projects: list[ProjectRef]) -> str:
+    """The manifest's resolved project list, for checking what would actually be searched."""
+    if not projects:
+        return "Manifest resolved to no projects at all."
+
+    headers = ("Path", "Name", "Revision", "Remote URL", "From")
+    rows = [
+        (p.path, p.name, p.revision, p.fetch_url, p.source_manifest)
+        for p in sorted(projects, key=lambda p: p.path)
+    ]
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells: tuple[str, ...]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+
+    lines = [fmt_row(headers), "  ".join("-" * w for w in widths)]
     lines.extend(fmt_row(row) for row in rows)
     return "\n".join(lines)
 

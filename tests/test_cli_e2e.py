@@ -143,6 +143,21 @@ class CliEndToEndTest(unittest.TestCase):
             exit_code = cli.main(argv)
         self.assertEqual(exit_code, 1)
 
+    def test_list_projects_shows_the_resolved_manifest_without_querying_remotes(self):
+        buf = StringIO()
+        with redirect_stdout(buf):
+            exit_code = cli.main([
+                "--branch", "feature/xyz",
+                "--manifest-url", str(self.manifest_repo),
+                "--manifest-branch", "main",
+                "--list-projects",
+            ])
+        out = buf.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("repo-a", out)
+        self.assertIn("repo-b", out)  # listed even though it has no feature branch
+        self.assertIn(str(self.repo_a), out)
+
     def test_unreachable_submanifest_is_reported_but_does_not_lose_other_repos(self):
         manifest_xml = f"""<manifest>
           <remote name="origin" fetch="{self.root}"/>

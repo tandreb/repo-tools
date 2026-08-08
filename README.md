@@ -66,6 +66,7 @@ einem Hinweis ab, statt zu raten; die betroffenen Werte können dann per
 | `--github-token` / `--gitlab-token` | Tokens für die jeweiligen APIs (auch via `$GITHUB_TOKEN`/`$GITLAB_TOKEN`) |
 | `--strict-no-fetch` | Verbietet den minimalen `git fetch`-Fallback, nur HTTP-APIs |
 | `--strict-manifest` | Bricht ab, wenn ein `<submanifest>` nicht auflösbar ist (statt es mit Warnung zu überspringen) |
+| `--list-projects` | Gibt nur die aufgelöste Projektliste aus (Pfad, Name, Revision, URL, Herkunfts-Manifest) und beendet sich, ohne Remotes abzufragen |
 | `--verbose` | Debug-Logging |
 
 ### Submanifeste

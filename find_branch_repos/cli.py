@@ -13,7 +13,7 @@ from . import file_fetchers, metadata_fetchers
 from .branch_checker import InvalidBranchNameError, check_branch_on_all
 from .manifest_resolver import ManifestResolutionError, resolve_manifest
 from .models import BranchResult, ProjectRef, RepoError, RunSummary
-from .output import print_summary_footer, render_table, write_json
+from .output import print_summary_footer, render_project_table, render_table, write_json
 from .repo_workspace import RepoWorkspaceError, make_submanifest_lookup, resolve_from_repo_dir
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Abort if any <submanifest> cannot be resolved. By default such a submanifest is "
         "skipped with a warning so the remaining repos are still reported.",
+    )
+    parser.add_argument(
+        "--list-projects",
+        action="store_true",
+        help="Resolve the manifest and print every project it yields (path, name, revision, URL), "
+        "then exit without querying any remote. Use this to check whether a repository you expect "
+        "is part of the manifest at all, and under which URL it would be searched.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser
@@ -141,16 +148,15 @@ def _resolve_manifest_location(args: argparse.Namespace) -> _ManifestLocation:
     )
 
 
-async def run(args: argparse.Namespace) -> RunSummary:
+def _resolve_projects(args: argparse.Namespace) -> tuple[list[ProjectRef], list[str], _ManifestLocation]:
     github_token = args.github_token or os.environ.get("GITHUB_TOKEN")
     gitlab_token = args.gitlab_token or os.environ.get("GITLAB_TOKEN")
     allow_fetch_fallback = not args.strict_no_fetch
 
     location = _resolve_manifest_location(args)
-
     file_chain = file_fetchers.default_chain(github_token, gitlab_token, allow_fetch_fallback)
 
-    manifest_warnings: list[str] = []
+    warnings: list[str] = []
     projects = resolve_manifest(
         location.url,
         location.branch,
@@ -159,10 +165,18 @@ async def run(args: argparse.Namespace) -> RunSummary:
         local_manifest_dir=location.local_manifest_dir,
         root_xml=location.root_xml,
         strict=args.strict_manifest,
-        warnings=manifest_warnings,
+        warnings=warnings,
         submanifest_lookup=location.submanifest_lookup,
     )
-    projects = _dedupe(projects)
+    return _dedupe(projects), warnings, location
+
+
+async def run(args: argparse.Namespace) -> RunSummary:
+    github_token = args.github_token or os.environ.get("GITHUB_TOKEN")
+    gitlab_token = args.gitlab_token or os.environ.get("GITLAB_TOKEN")
+    allow_fetch_fallback = not args.strict_no_fetch
+
+    projects, manifest_warnings, location = _resolve_projects(args)
 
     summary = RunSummary(
         branch=args.branch,
@@ -186,12 +200,24 @@ async def run(args: argparse.Namespace) -> RunSummary:
     return summary
 
 
+def _list_projects(args: argparse.Namespace) -> int:
+    projects, warnings, location = _resolve_projects(args)
+    print(f"# manifest: {location.file}@{location.branch} from {location.url}", file=sys.stderr)
+    print(render_project_table(projects))
+    print(f"\n{len(projects)} project(s) in the manifest.", file=sys.stderr)
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    return 2 if warnings else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
     try:
+        if args.list_projects:
+            return _list_projects(args)
         summary = asyncio.run(run(args))
     except InvalidBranchNameError as exc:
         print(f"error: {exc}", file=sys.stderr)
