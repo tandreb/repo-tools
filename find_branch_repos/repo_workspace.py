@@ -78,9 +78,16 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
     manifest_file = "default.xml"
     if manifest_link.is_symlink():
         try:
-            manifest_file = Path(manifest_link.readlink()).name
+            target = manifest_link.resolve(strict=True)
         except OSError as exc:
-            raise RepoWorkspaceError(f"could not read symlink {manifest_link}: {exc}") from exc
+            raise RepoWorkspaceError(f"could not resolve symlink {manifest_link}: {exc}") from exc
+        try:
+            # The root manifest file can live in a subdirectory of the manifest repo (e.g.
+            # "xml/default.xml") -- taking only the basename would drop that prefix and make
+            # us look for the file at the wrong path when fetching from the manifest repo.
+            manifest_file = target.relative_to(manifests_dir.resolve(strict=True)).as_posix()
+        except ValueError:
+            manifest_file = target.name
 
     local_manifests = repo_dir / "local_manifests"
     local_manifest_dir = str(local_manifests) if local_manifests.is_dir() else None
