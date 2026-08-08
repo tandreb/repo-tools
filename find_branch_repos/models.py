@@ -52,3 +52,6 @@ class RunSummary:
     projects_total: int = 0
     hits: list[BranchResult] = field(default_factory=list)
     errors: list[RepoError] = field(default_factory=list)
+    # Parts of the manifest that could not be resolved (e.g. an unreachable submanifest), meaning
+    # the project list -- and therefore the result -- is incomplete rather than merely degraded.
+    warnings: list[str] = field(default_factory=list)

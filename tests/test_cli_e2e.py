@@ -9,7 +9,7 @@ import json
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -141,6 +141,57 @@ class CliEndToEndTest(unittest.TestCase):
         buf = StringIO()
         with redirect_stdout(buf):
             exit_code = cli.main(argv)
+        self.assertEqual(exit_code, 1)
+
+    def test_unreachable_submanifest_is_reported_but_does_not_lose_other_repos(self):
+        manifest_xml = f"""<manifest>
+          <remote name="origin" fetch="{self.root}"/>
+          <default remote="origin" revision="main"/>
+          <project name="repo-a" path="a"/>
+          <project name="repo-b" path="b"/>
+          <submanifest name="vendor" project="no-such-manifest" path="vendor" revision="main"/>
+        </manifest>"""
+        _commit_file(self.manifest_repo, "default.xml", manifest_xml, "add submanifest")
+
+        json_out = self.root / "warn.json"
+        buf, err = StringIO(), StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            exit_code = cli.main([
+                "--branch", "feature/xyz",
+                "--manifest-url", str(self.manifest_repo),
+                "--manifest-branch", "main",
+                "--json-out", str(json_out),
+                "--skip-metadata",
+            ])
+
+        self.assertEqual(exit_code, 2)  # completed, but the manifest was only partially resolved
+        self.assertIn("a", buf.getvalue())
+        self.assertIn("WARNING", err.getvalue())
+        self.assertIn("vendor", err.getvalue())
+
+        payload = json.loads(json_out.read_text())
+        self.assertFalse(payload["manifest_complete"])
+        self.assertEqual(len(payload["warnings"]), 1)
+        self.assertEqual(payload["hits_count"], 1)
+
+    def test_strict_manifest_turns_unreachable_submanifest_into_hard_error(self):
+        manifest_xml = f"""<manifest>
+          <remote name="origin" fetch="{self.root}"/>
+          <default remote="origin" revision="main"/>
+          <project name="repo-a" path="a"/>
+          <submanifest name="vendor" project="no-such-manifest" path="vendor" revision="main"/>
+        </manifest>"""
+        _commit_file(self.manifest_repo, "default.xml", manifest_xml, "add submanifest")
+
+        buf = StringIO()
+        with redirect_stdout(buf):
+            exit_code = cli.main([
+                "--branch", "feature/xyz",
+                "--manifest-url", str(self.manifest_repo),
+                "--manifest-branch", "main",
+                "--strict-manifest",
+                "--skip-metadata",
+            ])
         self.assertEqual(exit_code, 1)
 
     def test_repo_dir_with_generated_stub_resolves_include_against_manifest_repo(self):

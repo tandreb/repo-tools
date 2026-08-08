@@ -51,6 +51,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Never fall back to a minimal `git fetch`; only use HTTP APIs (Gitiles/GitHub/GitLab). "
         "Hosts without such an API yield SHA-only results (ls-remote) or no metadata.",
     )
+    parser.add_argument(
+        "--strict-manifest",
+        action="store_true",
+        help="Abort if any <submanifest> cannot be resolved. By default such a submanifest is "
+        "skipped with a warning so the remaining repos are still reported.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser
 
@@ -140,6 +146,7 @@ async def run(args: argparse.Namespace) -> RunSummary:
 
     file_chain = file_fetchers.default_chain(github_token, gitlab_token, allow_fetch_fallback)
 
+    manifest_warnings: list[str] = []
     projects = resolve_manifest(
         location.url,
         location.branch,
@@ -147,6 +154,8 @@ async def run(args: argparse.Namespace) -> RunSummary:
         root_file=location.file,
         local_manifest_dir=location.local_manifest_dir,
         root_xml=location.root_xml,
+        strict=args.strict_manifest,
+        warnings=manifest_warnings,
     )
     projects = _dedupe(projects)
 
@@ -155,6 +164,7 @@ async def run(args: argparse.Namespace) -> RunSummary:
         manifest_url=location.url,
         manifest_branch=location.branch,
         projects_total=len(projects),
+        warnings=manifest_warnings,
     )
 
     hits, check_errors = await check_branch_on_all(projects, args.branch, args.concurrency, args.timeout)
@@ -195,7 +205,9 @@ def main(argv: list[str] | None = None) -> int:
         write_json(summary, args.json_out)
         print(f"JSON written to {args.json_out}", file=sys.stderr)
 
-    return 2 if summary.errors else 0
+    # Warnings mean the manifest was only partially resolved, so the result is incomplete -- that
+    # deserves the same "completed, but don't trust this as exhaustive" signal as per-repo errors.
+    return 2 if (summary.errors or summary.warnings) else 0
 
 
 if __name__ == "__main__":

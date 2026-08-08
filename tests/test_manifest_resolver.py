@@ -146,6 +146,67 @@ class SubmanifestTest(unittest.TestCase):
         libx = next(p for p in projects if p.path == "vendor/libx")
         self.assertEqual(libx.fetch_url, "https://vendor.example.com/base/lib-x")
 
+    def test_revision_falls_back_to_default_when_submanifest_and_remote_omit_it(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="release-42"/>
+          <submanifest name="vendor" project="vendor-manifest" path="vendor"/>
+        </manifest>
+        """
+        sub = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="release-42"/>
+          <project name="lib-x" path="libx"/>
+        </manifest>
+        """
+        fetcher = _FakeFileFetcher({
+            (ROOT_URL, "main", "default.xml"): root,
+            ("https://example.com/base/vendor-manifest", "release-42", "default.xml"): sub,
+        })
+        projects = resolve_manifest(ROOT_URL, "main", fetcher, strict=True)
+        self.assertEqual(sorted(p.path for p in projects), ["vendor/libx"])
+
+
+class UnreachableSubmanifestTest(unittest.TestCase):
+    """An unreachable submanifest repo (private, retired, wrong URL) must not discard the rest."""
+
+    ROOT = b"""
+    <manifest>
+      <remote name="origin" fetch="https://example.com/base"/>
+      <default remote="origin" revision="main"/>
+      <project name="proj-a" path="a"/>
+      <project name="proj-b" path="b"/>
+      <submanifest name="vendor" project="missing-manifest" path="vendor" revision="main"/>
+    </manifest>
+    """
+
+    def test_skips_submanifest_and_keeps_other_projects(self):
+        warnings: list[str] = []
+        projects = _resolve({(ROOT_URL, "main", "default.xml"): self.ROOT}, warnings=warnings)
+
+        self.assertEqual(sorted(p.path for p in projects), ["a", "b"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("vendor", warnings[0])
+        self.assertIn("missing-manifest", warnings[0])
+
+    def test_strict_mode_still_raises(self):
+        with self.assertRaises(ManifestResolutionError):
+            _resolve({(ROOT_URL, "main", "default.xml"): self.ROOT}, strict=True)
+
+    def test_include_failure_stays_fatal(self):
+        """Unlike a submanifest, an include lives in the manifest repo we could already read."""
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <include name="missing.xml"/>
+        </manifest>
+        """
+        with self.assertRaises(ManifestResolutionError):
+            _resolve({(ROOT_URL, "main", "default.xml"): root})
+
 
 class LocalManifestTest(unittest.TestCase):
     def test_local_manifest_dir_is_merged_in(self):

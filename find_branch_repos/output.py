@@ -51,6 +51,8 @@ def build_json_payload(summary: RunSummary) -> dict:
         "projects_total": summary.projects_total,
         "hits_count": len(summary.hits),
         "errors_count": len(summary.errors),
+        "warnings": list(summary.warnings),
+        "manifest_complete": not summary.warnings,
         "hits": [
             {
                 "path": hit.project.path,
@@ -84,9 +86,27 @@ def write_json(summary: RunSummary, path: str | Path) -> None:
     Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def print_summary_footer(summary: RunSummary, file=sys.stderr) -> None:
+def print_summary_footer(summary: RunSummary, file=None) -> None:
+    # Resolved here, not as a default argument: a `file=sys.stderr` default binds the stream at
+    # import time, which makes the footer ignore any later redirect of sys.stderr.
+    file = sys.stderr if file is None else file
     print(
         f"\n{len(summary.hits)}/{summary.projects_total} repos have branch '{summary.branch}', "
         f"{len(summary.errors)} unreachable/failed.",
         file=file,
     )
+    if summary.warnings:
+        # The project list itself is incomplete here, so say that plainly rather than letting the
+        # counts above read as if the whole manifest had been searched.
+        print(
+            f"\nWARNING: {len(summary.warnings)} part(s) of the manifest could not be resolved, "
+            "so repos below them were NOT searched:",
+            file=file,
+        )
+        for warning in summary.warnings:
+            print(f"  - {warning}", file=file)
+        print(
+            "  Hint: private repos may need --github-token/--gitlab-token or git credentials. "
+            "Use --strict-manifest to treat this as a hard error.",
+            file=file,
+        )

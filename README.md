@@ -65,13 +65,28 @@ einem Hinweis ab, statt zu raten; die betroffenen Werte können dann per
 | `--json-out` | Pfad für die JSON-Ausgabe |
 | `--github-token` / `--gitlab-token` | Tokens für die jeweiligen APIs (auch via `$GITHUB_TOKEN`/`$GITLAB_TOKEN`) |
 | `--strict-no-fetch` | Verbietet den minimalen `git fetch`-Fallback, nur HTTP-APIs |
+| `--strict-manifest` | Bricht ab, wenn ein `<submanifest>` nicht auflösbar ist (statt es mit Warnung zu überspringen) |
 | `--verbose` | Debug-Logging |
+
+### Unerreichbare Submanifeste
+
+Ein `<submanifest>` liegt in einem eigenen Repository, das privat, stillgelegt oder mit den
+vorhandenen Credentials schlicht nicht lesbar sein kann. Ein einzelnes solches Submanifest
+lässt daher nicht mehr den gesamten Lauf scheitern: es wird übersprungen, deutlich als
+Warnung ausgegeben (inkl. `warnings`/`manifest_complete` im JSON) und der Exit-Code ist `2`.
+Damit ist das Ergebnis nutzbar, aber erkennbar **unvollständig** — die Repos unterhalb des
+übersprungenen Submanifests wurden nicht durchsucht. Mit `--strict-manifest` wird daraus
+wieder ein harter Abbruch.
+
+`<include>`-Fehler bleiben dagegen immer fatal: ein Include liegt im selben Manifest-Repo,
+das bereits gelesen werden konnte — schlägt es fehl, ist das Manifest selbst inkonsistent.
 
 ### Exit-Codes
 
 - `0`: Lauf erfolgreich (auch wenn 0 Treffer)
 - `1`: Manifest nicht auflösbar, `.repo`-Workspace nicht auswertbar oder ungültiger Branch-Name — Abbruch
-- `2`: Lauf abgeschlossen, aber mit Fehlern bei einzelnen Repos (siehe `errors` im JSON)
+- `2`: Lauf abgeschlossen, aber Ergebnis unvollständig — Fehler bei einzelnen Repos (`errors`)
+  und/oder nicht auflösbare Manifest-Teile (`warnings`)
 
 ## Tests
 
