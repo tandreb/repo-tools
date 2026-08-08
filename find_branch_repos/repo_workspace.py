@@ -22,6 +22,10 @@ class RepoWorkspaceInfo:
     manifest_branch: str
     manifest_file: str
     local_manifest_dir: str | None
+    # Content of a locally generated .repo/manifest.xml, when that file is a real file rather
+    # than a symlink into .repo/manifests/ (see resolve_from_repo_dir). It is used as the root
+    # manifest directly; its <include>s still resolve against the remote manifest repo.
+    root_manifest_xml: bytes | None = None
 
 
 def _find_repo_dir(path: Path) -> Path:
@@ -61,7 +65,9 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
 
     manifest_url = _git(["remote", "get-url", "origin"], cwd=manifests_dir)
 
-    local_branch = _git(["symbolic-ref", "--short", "-q", "HEAD"], cwd=manifests_dir)
+    # `symbolic-ref -q` exits non-zero on a detached HEAD, so this must not use the checking
+    # variant -- otherwise the detached case dies with a raw git error instead of the hint below.
+    local_branch = _git_optional(["symbolic-ref", "--short", "-q", "HEAD"], cwd=manifests_dir)
     if not local_branch:
         raise RepoWorkspaceError(
             f"{manifests_dir} has a detached HEAD, so the manifest branch can't be inferred; "
@@ -74,12 +80,14 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
     merge_ref = _git_optional(["config", "--get", f"branch.{local_branch}.merge"], cwd=manifests_dir)
     branch = merge_ref.removeprefix("refs/heads/") if merge_ref else local_branch
 
-    manifest_link = repo_dir / "manifest.xml"
-    if manifest_link.is_symlink():
+    manifest_path = repo_dir / "manifest.xml"
+    root_manifest_xml: bytes | None = None
+    if manifest_path.is_symlink():
+        # Older repo versions symlink .repo/manifest.xml into .repo/manifests/.
         try:
-            target = manifest_link.resolve(strict=True)
+            target = manifest_path.resolve(strict=True)
         except OSError as exc:
-            raise RepoWorkspaceError(f"could not resolve symlink {manifest_link}: {exc}") from exc
+            raise RepoWorkspaceError(f"could not resolve symlink {manifest_path}: {exc}") from exc
         try:
             # The root manifest file can live in a subdirectory of the manifest repo (e.g.
             # "xml/default.xml") -- taking only the basename would drop that prefix and make
@@ -87,19 +95,21 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
             manifest_file = target.relative_to(manifests_dir.resolve(strict=True)).as_posix()
         except ValueError:
             manifest_file = target.name
-    elif manifest_link.is_file():
-        # Some repo-tool variants write manifest.xml as a plain copy instead of a symlink, which
-        # loses the information we need (its path within the manifest repo). We can't safely guess
-        # a filename here -- silently defaulting to "default.xml" produced confusing fetch failures
-        # when that guess was wrong.
-        raise RepoWorkspaceError(
-            f"{manifest_link} is a regular file, not a symlink, so the root manifest file name/path "
-            "can't be determined automatically; pass --manifest-file explicitly (and --manifest-branch "
-            "if it also isn't the correct default)"
-        )
+    elif manifest_path.is_file():
+        # Current repo versions no longer symlink; they generate a small stub that points at the
+        # real manifest via <include name="..."/>. repo documents that this file "is interpreted
+        # as if it existed inside the manifest repo", so using its content as the root manifest
+        # makes those includes resolve against the manifest repo exactly as repo intends -- and
+        # it works regardless of what the real file is called or where it lives.
+        try:
+            root_manifest_xml = manifest_path.read_bytes()
+        except OSError as exc:
+            raise RepoWorkspaceError(f"could not read {manifest_path}: {exc}") from exc
+        manifest_file = str(manifest_path)
     else:
         raise RepoWorkspaceError(
-            f"{manifest_link} not found; pass --manifest-file explicitly to specify the root manifest file"
+            f"{manifest_path} not found -- is this a `repo init`-ed workspace? "
+            "Pass --manifest-file (and --manifest-url) explicitly instead."
         )
 
     local_manifests = repo_dir / "local_manifests"
@@ -110,4 +120,5 @@ def resolve_from_repo_dir(path: str | Path) -> RepoWorkspaceInfo:
         manifest_branch=branch,
         manifest_file=manifest_file,
         local_manifest_dir=local_manifest_dir,
+        root_manifest_xml=root_manifest_xml,
     )

@@ -32,7 +32,7 @@ python3 -m find_branch_repos \
 Alternativ, wenn bereits ein `repo init`-ter Workspace lokal existiert, kann statt
 `--manifest-url` einfach auf dessen `.repo`-Verzeichnis (oder den Workspace-Root darüber)
 verwiesen werden — Manifest-URL, -Branch und Root-Datei werden dann aus den dort bereits
-vorhandenen lokalen Git-Metadaten gelesen (kein Netzwerkzugriff dafür nötig):
+vorhandenen lokalen Metadaten gelesen (kein Netzwerkzugriff dafür nötig):
 
 ```bash
 python3 -m find_branch_repos \
@@ -40,6 +40,14 @@ python3 -m find_branch_repos \
   --repo-dir ~/aosp \
   --json-out result.json
 ```
+
+Dabei werden beide `.repo`-Varianten unterstützt: der von aktuellen `repo`-Versionen
+generierte `manifest.xml`-Stub (dessen `<include>` gegen das Manifest-Repo aufgelöst wird)
+ebenso wie der Symlink älterer Versionen. Der Manifest-Branch wird aus dem Upstream von
+`.repo/manifests` gelesen — nicht aus dessen lokalem Branchnamen, der bei `repo` immer
+`default` heißt. Lässt sich etwas davon nicht eindeutig bestimmen, bricht das Skript mit
+einem Hinweis ab, statt zu raten; die betroffenen Werte können dann per
+`--manifest-file`/`--manifest-branch` explizit gesetzt werden.
 
 ### Wichtige Optionen
 

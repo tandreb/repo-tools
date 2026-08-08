@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import sys
+from dataclasses import dataclass
 
 from . import file_fetchers, metadata_fetchers
 from .branch_checker import InvalidBranchNameError, check_branch_on_all
@@ -89,28 +90,45 @@ def _dedupe(projects: list[ProjectRef]) -> list[ProjectRef]:
     return deduped
 
 
-def _resolve_manifest_location(args: argparse.Namespace) -> tuple[str, str, str, str | None]:
+@dataclass
+class _ManifestLocation:
+    url: str
+    branch: str
+    file: str
+    local_manifest_dir: str | None
+    root_xml: bytes | None = None
+
+
+def _resolve_manifest_location(args: argparse.Namespace) -> _ManifestLocation:
     manifest_url = args.manifest_url
     manifest_branch = args.manifest_branch
     manifest_file = args.manifest_file
     local_manifest_dir = args.local_manifest_dir
+    root_xml: bytes | None = None
 
     if args.repo_dir:
         info = resolve_from_repo_dir(args.repo_dir)
         manifest_url = manifest_url or info.manifest_url
         manifest_branch = manifest_branch or info.manifest_branch
-        manifest_file = manifest_file or info.manifest_file
         local_manifest_dir = local_manifest_dir or info.local_manifest_dir
-        print(
-            f"Detected from --repo-dir: manifest-url={manifest_url} manifest-branch={manifest_branch} "
-            f"manifest-file={manifest_file} local-manifest-dir={local_manifest_dir}",
-            file=sys.stderr,
+        if not manifest_file:
+            manifest_file = info.manifest_file
+            root_xml = info.root_manifest_xml
+        logger.info(
+            "detected from --repo-dir: url=%s branch=%s file=%s local-manifests=%s",
+            manifest_url, manifest_branch, manifest_file, local_manifest_dir,
         )
 
     if not manifest_url:
         raise RepoWorkspaceError("either --manifest-url or --repo-dir is required")
 
-    return manifest_url, manifest_branch or "master", manifest_file or "default.xml", local_manifest_dir
+    return _ManifestLocation(
+        url=manifest_url,
+        branch=manifest_branch or "master",
+        file=manifest_file or "default.xml",
+        local_manifest_dir=local_manifest_dir,
+        root_xml=root_xml,
+    )
 
 
 async def run(args: argparse.Namespace) -> RunSummary:
@@ -118,23 +136,24 @@ async def run(args: argparse.Namespace) -> RunSummary:
     gitlab_token = args.gitlab_token or os.environ.get("GITLAB_TOKEN")
     allow_fetch_fallback = not args.strict_no_fetch
 
-    manifest_url, manifest_branch, manifest_file, local_manifest_dir = _resolve_manifest_location(args)
+    location = _resolve_manifest_location(args)
 
     file_chain = file_fetchers.default_chain(github_token, gitlab_token, allow_fetch_fallback)
 
     projects = resolve_manifest(
-        manifest_url,
-        manifest_branch,
+        location.url,
+        location.branch,
         file_chain,
-        root_file=manifest_file,
-        local_manifest_dir=local_manifest_dir,
+        root_file=location.file,
+        local_manifest_dir=location.local_manifest_dir,
+        root_xml=location.root_xml,
     )
     projects = _dedupe(projects)
 
     summary = RunSummary(
         branch=args.branch,
-        manifest_url=manifest_url,
-        manifest_branch=manifest_branch,
+        manifest_url=location.url,
+        manifest_branch=location.branch,
         projects_total=len(projects),
     )
 

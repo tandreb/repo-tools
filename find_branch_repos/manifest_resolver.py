@@ -200,9 +200,23 @@ def resolve_manifest(
     file_fetcher: FileFetcherChain,
     root_file: str = "default.xml",
     local_manifest_dir: str | Path | None = None,
+    root_xml: bytes | None = None,
 ) -> list[ProjectRef]:
+    """Resolve a manifest tree into a flat project list.
+
+    `root_xml`, when given, supplies the root manifest's content directly instead of fetching
+    `root_file` from the manifest repo. Any <include>/<submanifest> it contains is still resolved
+    remotely against manifest_repo_url, which is exactly how repo treats its generated
+    .repo/manifest.xml: as if that file lived inside the manifest repo.
+    """
     scope = _Scope()
-    root = _fetch_xml(file_fetcher, manifest_repo_url, manifest_ref, root_file, "root")
+    if root_xml is None:
+        root = _fetch_xml(file_fetcher, manifest_repo_url, manifest_ref, root_file, "root")
+    else:
+        try:
+            root = ET.fromstring(root_xml)
+        except ET.ParseError as exc:
+            raise ManifestResolutionError(f"invalid XML in root manifest {root_file}: {exc}") from exc
     _process_manifest(
         root,
         repo_url=manifest_repo_url,
