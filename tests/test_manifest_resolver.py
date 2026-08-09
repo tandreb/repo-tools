@@ -428,6 +428,169 @@ class LocalManifestTest(unittest.TestCase):
                 local_manifest_dir="/no/such/directory",
             )
 
+    def test_include_inside_a_local_manifest_is_resolved(self):
+        """A local manifest pulling its projects in via an <include> must not silently lose them."""
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <project name="proj-a" path="a"/>
+        </manifest>
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            local_dir = Path(tmp)
+            (local_dir / "local.xml").write_text('<manifest><include name="vendor.inc"/></manifest>')
+            (local_dir / "vendor.inc").write_text('<manifest><project name="proj-vendor" path="vendor"/></manifest>')
+            projects = _resolve(
+                {(ROOT_URL, "main", "default.xml"): root},
+                local_manifest_dir=local_dir,
+            )
+        # proj-vendor inherits <default remote="origin"> from the main manifest, as it does in repo
+        self.assertEqual(sorted(p.path for p in projects), ["a", "vendor"])
+
+    def test_local_manifest_include_is_also_looked_up_next_to_the_manifest_checkout(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+        </manifest>
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp)
+            local_dir = repo_dir / "local_manifests"
+            local_dir.mkdir()
+            (repo_dir / "manifests").mkdir()
+            (local_dir / "local.xml").write_text('<manifest><include name="extra.inc"/></manifest>')
+            (repo_dir / "manifests" / "extra.inc").write_text('<manifest><project name="proj-x" path="x"/></manifest>')
+            projects = _resolve({(ROOT_URL, "main", "default.xml"): root}, local_manifest_dir=local_dir)
+        self.assertEqual([p.path for p in projects], ["x"])
+
+    def test_missing_local_manifest_include_raises(self):
+        root = b"""<manifest><remote name="o" fetch="https://x/base"/></manifest>"""
+        with tempfile.TemporaryDirectory() as tmp:
+            local_dir = Path(tmp)
+            (local_dir / "local.xml").write_text('<manifest><include name="gone.inc"/></manifest>')
+            with self.assertRaises(ManifestResolutionError):
+                _resolve({(ROOT_URL, "main", "default.xml"): root}, local_manifest_dir=local_dir)
+
+    def test_relative_fetch_in_local_manifest_is_resolved_against_manifest_url(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+        </manifest>
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            local_dir = Path(tmp)
+            (local_dir / "local.xml").write_text(
+                '<manifest><remote name="extra" fetch=".."/>'
+                '<project name="proj-x" path="x" remote="extra"/></manifest>'
+            )
+            projects = _resolve({(ROOT_URL, "main", "default.xml"): root}, local_manifest_dir=local_dir)
+        self.assertEqual(projects[0].fetch_url, "https://example.com/proj-x")
+
+    def test_local_manifest_can_remove_a_project_from_the_main_manifest(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <project name="proj-a" path="a"/>
+          <project name="proj-b" path="b"/>
+        </manifest>
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            local_dir = Path(tmp)
+            (local_dir / "local.xml").write_text('<manifest><remove-project name="proj-b"/></manifest>')
+            projects = _resolve({(ROOT_URL, "main", "default.xml"): root}, local_manifest_dir=local_dir)
+        self.assertEqual([p.path for p in projects], ["a"])
+
+
+class ElementOrderTest(unittest.TestCase):
+    """repo flattens all <include>s first and only then processes nodes by element type.
+
+    Manifests split into `.inc` fragments lean on that hard: a fragment routinely uses a <remote>
+    or <default> that is declared in another file, or below the <include> that pulled it in.
+    """
+
+    def test_include_before_remote_and_default(self):
+        root = b"""
+        <manifest>
+          <include name="projects.inc"/>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+        </manifest>
+        """
+        projects = _resolve({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "main", "projects.inc"): b'<manifest><project name="proj-a" path="a"/></manifest>',
+        })
+        self.assertEqual([p.path for p in projects], ["a"])
+        self.assertEqual(projects[0].revision, "main")
+
+    def test_project_can_use_a_remote_declared_in_a_later_include(self):
+        root = b"""
+        <manifest>
+          <default remote="vendor" revision="main"/>
+          <project name="proj-a" path="a"/>
+          <include name="remotes.inc"/>
+        </manifest>
+        """
+        projects = _resolve({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "main", "remotes.inc"): b'<manifest><remote name="vendor" fetch="https://example.com/base"/></manifest>',
+        })
+        self.assertEqual(projects[0].fetch_url, "https://example.com/base/proj-a")
+
+    def test_remove_project_applies_to_later_includes(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <remove-project name="proj-a"/>
+          <include name="projects.inc"/>
+        </manifest>
+        """
+        projects = _resolve({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "main", "projects.inc"): (
+                b'<manifest><project name="proj-a" path="a"/><project name="proj-b" path="b"/></manifest>'
+            ),
+        })
+        self.assertEqual([p.path for p in projects], ["b"])
+
+    def test_partial_default_in_a_fragment_does_not_drop_the_remote(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <include name="pin.inc"/>
+          <project name="proj-a" path="a"/>
+        </manifest>
+        """
+        projects = _resolve({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "main", "pin.inc"): b'<manifest><default revision="release"/></manifest>',
+        })
+        self.assertEqual(projects[0].remote_alias, "origin")
+        self.assertEqual(projects[0].revision, "release")
+
+    def test_same_fragment_included_from_two_files_is_not_a_cycle(self):
+        root = b"""
+        <manifest>
+          <remote name="origin" fetch="https://example.com/base"/>
+          <default remote="origin" revision="main"/>
+          <include name="a.inc"/>
+          <include name="b.inc"/>
+        </manifest>
+        """
+        projects = _resolve({
+            (ROOT_URL, "main", "default.xml"): root,
+            (ROOT_URL, "main", "a.inc"): b'<manifest><include name="common.inc"/></manifest>',
+            (ROOT_URL, "main", "b.inc"): b'<manifest><include name="common.inc"/></manifest>',
+            (ROOT_URL, "main", "common.inc"): b'<manifest><project name="proj-c" path="c"/></manifest>',
+        })
+        self.assertEqual([p.path for p in projects], ["c"])
+
 
 if __name__ == "__main__":
     unittest.main()

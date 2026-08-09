@@ -4,6 +4,12 @@ Handles <remote>/<default> inheritance, <include>, <submanifest>, <remove-projec
 and an optional local-manifest directory (read from disk, since local manifests are
 not centrally fetchable). Manifest file content itself is read via a FileFetcherChain,
 never via a persistent checkout.
+
+Resolution mirrors what `repo` itself does (XmlManifest._ParseManifestXml/_ParseManifest):
+<include>s are first flattened into one node list, and only then are the nodes processed
+*by element type* -- every <remote>, then <default>, then <submanifest>, then <project>,
+and <remove-project> last. Element order inside and across manifest files therefore does
+not matter, which is exactly what manifests built from `.inc` fragments rely on.
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ import posixpath
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .file_fetchers import FileFetchError, FileFetcherChain
@@ -46,7 +52,21 @@ class _Scope:
     projects: dict[str, ProjectRef] = field(default_factory=dict)  # keyed by local path
 
 
+@dataclass(frozen=True)
+class _Node:
+    """One manifest element plus where it came from, kept for error messages and reporting.
+
+    <include> is resolved away while collecting, so a node's element is never an <include>.
+    """
+
+    elem: ET.Element
+    context: str  # human-readable origin, e.g. 'vendor.inc@main (root)'
+    source_label: str  # coarse origin recorded on ProjectRef: 'root', 'submanifest:x', ...
+
+
 SubmanifestLookup = Callable[[str, str], bytes | None]
+# (include name, context) -> raw XML; raises ManifestResolutionError if unreadable.
+IncludeReader = Callable[[str, str], bytes]
 
 
 @dataclass
@@ -110,82 +130,120 @@ def _join_path(prefix: str, path: str) -> str:
     return posixpath.normpath(posixpath.join(prefix, path)) if prefix else path
 
 
-def _fetch_xml(file_fetcher: FileFetcherChain, repo_url: str, ref: str, filename: str, context: str) -> ET.Element:
+def _parse_xml(content: bytes, what: str) -> ET.Element:
+    try:
+        return ET.fromstring(content)
+    except ET.ParseError as exc:
+        raise ManifestResolutionError(f"invalid XML in {what}: {exc}") from exc
+
+
+def _read_remote_file(file_fetcher: FileFetcherChain, repo_url: str, ref: str, filename: str, context: str) -> bytes:
     try:
         content, _provider = file_fetcher.fetch(repo_url, ref, filename)
     except FileFetchError as exc:
         raise ManifestResolutionError(f"could not read {filename}@{ref} from {repo_url} ({context}): {exc}") from exc
-    try:
-        return ET.fromstring(content)
-    except ET.ParseError as exc:
-        raise ManifestResolutionError(f"invalid XML in {filename}@{ref} from {repo_url} ({context}): {exc}") from exc
+    return content
 
 
-def _process_manifest(
+def _collect_nodes(
     root: ET.Element,
     *,
-    repo_url: str,
-    ref: str,
     filename: str,
-    path_prefix: str,
-    visited: frozenset[tuple[str, str, str]],
+    source_label: str,
+    describe: Callable[[str], str],
+    read_include: IncludeReader,
+    chain: tuple[str, ...] = (),
+) -> list[_Node]:
+    """Flatten one manifest file and everything it <include>s into a single node list.
+
+    Nothing is interpreted here on purpose: repo decides what a <project> means only after every
+    file is on the table, so a fragment may rely on a <remote> or <default> that is declared in a
+    file included later on (or in the parent, below the <include> that pulled the fragment in).
+    """
+    if filename in chain:
+        raise ManifestResolutionError("cyclic <include> detected: " + " -> ".join([*chain, filename]))
+    chain = (*chain, filename)
+    context = describe(filename)
+
+    nodes: list[_Node] = []
+    for elem in root:
+        if elem.tag != "include":
+            nodes.append(_Node(elem=elem, context=context, source_label=source_label))
+            continue
+        include_name = _require(elem, "name", context)
+        included_root = _parse_xml(read_include(include_name, context), describe(include_name))
+        nodes.extend(
+            _collect_nodes(
+                included_root,
+                filename=include_name,
+                source_label=source_label,
+                describe=describe,
+                read_include=read_include,
+                chain=chain,
+            )
+        )
+    return nodes
+
+
+def _process_nodes(
+    nodes: list[_Node],
+    *,
     scope: _Scope,
     ctx: _Context,
-    source_label: str,
+    repo_url: str,
+    path_prefix: str,
+    visited_units: frozenset[tuple[str, str, str]],
 ) -> None:
-    key = (repo_url, ref, filename)
-    if key in visited:
-        chain = " -> ".join(f"{f}@{r}" for _, r, f in visited)
-        raise ManifestResolutionError(f"cyclic <include> detected: {filename}@{ref} (chain: {chain} -> {filename}@{ref})")
-    visited = visited | {key}
-    context = f"{filename}@{ref} ({source_label})"
-
-    for elem in root:
-        if elem.tag == "remote":
-            name = _require(elem, "name", context)
+    """Interpret a flattened node list in repo's element-type order, not in document order."""
+    for node in nodes:
+        if node.elem.tag == "remote":
+            name = _require(node.elem, "name", node.context)
             scope.remotes[name] = _Remote(
                 name=name,
-                fetch=_resolve_fetch_url(_require(elem, "fetch", context), repo_url),
-                revision=elem.attrib.get("revision"),
+                fetch=_resolve_fetch_url(_require(node.elem, "fetch", node.context), repo_url),
+                revision=node.elem.attrib.get("revision"),
             )
 
-        elif elem.tag == "default":
-            scope.default = _Default(remote=elem.attrib.get("remote"), revision=elem.attrib.get("revision"))
-
-        elif elem.tag == "project":
-            _add_project(elem, scope=scope, path_prefix=path_prefix, source_label=source_label, context=context)
-
-        elif elem.tag == "remove-project":
-            _remove_project(elem, scope=scope, path_prefix=path_prefix, context=context)
-
-        elif elem.tag == "include":
-            include_name = _require(elem, "name", context)
-            included_root = _fetch_xml(ctx.file_fetcher, repo_url, ref, include_name, source_label)
-            _process_manifest(
-                included_root,
-                repo_url=repo_url,
-                ref=ref,
-                filename=include_name,
-                path_prefix=path_prefix,
-                visited=visited,
-                scope=scope,
-                ctx=ctx,
-                source_label=source_label,
+    for node in nodes:
+        if node.elem.tag == "default":
+            # repo rejects a second, differing <default> outright. Merging attribute-wise is
+            # deliberately more forgiving: a fragment that only pins a revision must not blank
+            # out the remote and cost us every project that relies on it.
+            scope.default = _Default(
+                remote=node.elem.attrib.get("remote") or scope.default.remote,
+                revision=node.elem.attrib.get("revision") or scope.default.revision,
             )
 
-        elif elem.tag == "submanifest":
+    for node in nodes:
+        if node.elem.tag == "submanifest":
             _process_submanifest(
-                elem,
+                node.elem,
                 scope=scope,
                 ctx=ctx,
-                visited=visited,
                 path_prefix=path_prefix,
                 parent_manifest_url=repo_url,
-                context=context,
+                context=node.context,
+                visited_units=visited_units,
             )
 
-        # other tags (<copyfile>, <linkfile>, <extend-project>, <repo-hooks>, ...) don't affect
-        # which repos/branches exist and are intentionally ignored
+    for node in nodes:
+        if node.elem.tag == "project":
+            _add_project(
+                node.elem,
+                scope=scope,
+                path_prefix=path_prefix,
+                source_label=node.source_label,
+                context=node.context,
+            )
+
+    # Last, exactly as repo does it: a <remove-project> drops a project no matter which file
+    # added it, including files pulled in by an <include> further down.
+    for node in nodes:
+        if node.elem.tag == "remove-project":
+            _remove_project(node.elem, scope=scope, path_prefix=path_prefix, context=node.context)
+
+    # other tags (<copyfile>, <linkfile>, <extend-project>, <repo-hooks>, ...) don't affect
+    # which repos/branches exist and are intentionally ignored
 
 
 def _add_project(elem: ET.Element, *, scope: _Scope, path_prefix: str, source_label: str, context: str) -> None:
@@ -240,10 +298,10 @@ def _process_submanifest(
     *,
     scope: _Scope,
     ctx: _Context,
-    visited: frozenset[tuple[str, str, str]],
     path_prefix: str,
     parent_manifest_url: str,
     context: str,
+    visited_units: frozenset[tuple[str, str, str]],
 ) -> None:
     name = _require(elem, "name", context)
     project_name = elem.attrib.get("project")
@@ -268,33 +326,44 @@ def _process_submanifest(
     manifest_name = elem.attrib.get("manifest-name", "default.xml")
     sub_path_prefix = _join_path(path_prefix, elem.attrib.get("path") or sub_ref.split("/")[-1])
     sub_label = f"submanifest:{name}"
+    unit = (sub_repo_url, sub_ref, manifest_name)
 
     sub_scope = _Scope()
-    sub_ctx = ctx
     try:
+        if unit in visited_units:
+            raise ManifestResolutionError(f"cyclic <submanifest>: {manifest_name}@{sub_ref} from {sub_repo_url}")
+
         local_xml = ctx.submanifest_lookup(sub_path_prefix, manifest_name) if ctx.submanifest_lookup else None
         if local_xml is None:
-            sub_root = _fetch_xml(ctx.file_fetcher, sub_repo_url, sub_ref, manifest_name, sub_label)
+            sub_fetcher: FileFetcherChain = ctx.file_fetcher
+            content = _read_remote_file(sub_fetcher, sub_repo_url, sub_ref, manifest_name, sub_label)
         else:
             # The workspace already has this submanifest checked out, so read it from there and
             # resolve its own <include>s from the same local checkout instead of over the network.
             logger.debug("using locally checked out submanifest '%s' for %s", name, sub_path_prefix)
-            try:
-                sub_root = ET.fromstring(local_xml)
-            except ET.ParseError as exc:
-                raise ManifestResolutionError(f"invalid XML in local submanifest '{name}' ({manifest_name}): {exc}") from exc
-            sub_ctx = replace(ctx, file_fetcher=_LocalSubmanifestFetcher(ctx.submanifest_lookup, sub_path_prefix))
+            sub_fetcher = _LocalSubmanifestFetcher(ctx.submanifest_lookup, sub_path_prefix)
+            content = local_xml
 
-        _process_manifest(
-            sub_root,
-            repo_url=sub_repo_url,
-            ref=sub_ref,
+        def describe(fn: str, _ref: str = sub_ref, _label: str = sub_label) -> str:
+            return f"{fn}@{_ref} ({_label})"
+
+        def read_include(include_name: str, include_context: str) -> bytes:
+            return _read_remote_file(sub_fetcher, sub_repo_url, sub_ref, include_name, include_context)
+
+        nodes = _collect_nodes(
+            _parse_xml(content, describe(manifest_name)),
             filename=manifest_name,
-            path_prefix=sub_path_prefix,
-            visited=visited,
-            scope=sub_scope,
-            ctx=sub_ctx,
             source_label=sub_label,
+            describe=describe,
+            read_include=read_include,
+        )
+        _process_nodes(
+            nodes,
+            scope=sub_scope,
+            ctx=ctx,
+            repo_url=sub_repo_url,
+            path_prefix=sub_path_prefix,
+            visited_units=visited_units | {unit},
         )
     except ManifestResolutionError as exc:
         # A submanifest lives in its own repository, which may be private, retired, or simply
@@ -309,6 +378,53 @@ def _process_submanifest(
         logger.debug("skipping submanifest '%s' (%s@%s): %s", name, sub_repo_url, sub_ref, exc)
         return
     scope.projects.update(sub_scope.projects)
+
+
+def _collect_local_manifest_nodes(directory: Path) -> list[_Node]:
+    """Flatten .repo/local_manifests/*.xml (and whatever they <include>) into nodes.
+
+    These are merged into the same node list as the main manifest, which is what repo does too --
+    so a local manifest can use a <remote> from the main manifest, and its own <include>s work.
+    """
+    if not directory.is_dir():
+        raise ManifestResolutionError(f"local manifest directory not found: {directory}")
+
+    # repo resolves a local manifest's includes against the manifest checkout; in practice
+    # fragments are just as often dropped next to the local manifest itself, so accept both.
+    search_dirs = [directory, directory.parent / "manifests"]
+
+    nodes: list[_Node] = []
+    for xml_file in sorted(directory.glob("*.xml")):
+        label = f"local manifest {xml_file.name}"
+
+        def describe(fn: str, _file: str = xml_file.name, _label: str = label) -> str:
+            return _label if fn == _file else f"{fn} (included from {_label})"
+
+        def read_include(include_name: str, include_context: str) -> bytes:
+            for base in search_dirs:
+                candidate = base / include_name
+                if candidate.is_file():
+                    try:
+                        return candidate.read_bytes()
+                    except OSError as exc:
+                        raise ManifestResolutionError(f"could not read {candidate} ({include_context}): {exc}") from exc
+            searched = " or ".join(str(d) for d in search_dirs)
+            raise ManifestResolutionError(f"<include name='{include_name}'> in {include_context} not found in {searched}")
+
+        try:
+            content = xml_file.read_bytes()
+        except OSError as exc:
+            raise ManifestResolutionError(f"could not read local manifest {xml_file}: {exc}") from exc
+        nodes.extend(
+            _collect_nodes(
+                _parse_xml(content, label),
+                filename=xml_file.name,
+                source_label=label,
+                describe=describe,
+                read_include=read_include,
+            )
+        )
+    return nodes
 
 
 def resolve_manifest(
@@ -340,46 +456,37 @@ def resolve_manifest(
         submanifest_lookup=submanifest_lookup,
     )
     scope = _Scope()
+
     if root_xml is None:
-        root = _fetch_xml(file_fetcher, manifest_repo_url, manifest_ref, root_file, "root")
+        content = _read_remote_file(file_fetcher, manifest_repo_url, manifest_ref, root_file, "root")
+        root_what = f"{root_file}@{manifest_ref} (root)"
     else:
-        try:
-            root = ET.fromstring(root_xml)
-        except ET.ParseError as exc:
-            raise ManifestResolutionError(f"invalid XML in root manifest {root_file}: {exc}") from exc
-    _process_manifest(
-        root,
-        repo_url=manifest_repo_url,
-        ref=manifest_ref,
+        content = root_xml
+        root_what = f"root manifest {root_file}"
+
+    def describe(fn: str) -> str:
+        return f"{fn}@{manifest_ref} (root)"
+
+    def read_include(include_name: str, include_context: str) -> bytes:
+        return _read_remote_file(file_fetcher, manifest_repo_url, manifest_ref, include_name, include_context)
+
+    nodes = _collect_nodes(
+        _parse_xml(content, root_what),
         filename=root_file,
-        path_prefix="",
-        visited=frozenset(),
+        source_label="root",
+        describe=describe,
+        read_include=read_include,
+    )
+    if local_manifest_dir:
+        nodes.extend(_collect_local_manifest_nodes(Path(local_manifest_dir)))
+
+    _process_nodes(
+        nodes,
         scope=scope,
         ctx=ctx,
-        source_label="root",
+        repo_url=manifest_repo_url,
+        path_prefix="",
+        visited_units=frozenset(),
     )
 
-    if local_manifest_dir:
-        _apply_local_manifests(Path(local_manifest_dir), scope)
-
     return sorted(scope.projects.values(), key=lambda p: p.path)
-
-
-def _apply_local_manifests(directory: Path, scope: _Scope) -> None:
-    if not directory.is_dir():
-        raise ManifestResolutionError(f"local manifest directory not found: {directory}")
-    for xml_file in sorted(directory.glob("*.xml")):
-        try:
-            root = ET.fromstring(xml_file.read_bytes())
-        except ET.ParseError as exc:
-            raise ManifestResolutionError(f"invalid XML in local manifest {xml_file}: {exc}") from exc
-        context = f"local manifest {xml_file.name}"
-        # local manifests are read straight from disk; include/submanifest are not supported here
-        for elem in root:
-            if elem.tag == "remote":
-                name = _require(elem, "name", context)
-                scope.remotes[name] = _Remote(name=name, fetch=_require(elem, "fetch", context), revision=elem.attrib.get("revision"))
-            elif elem.tag == "project":
-                _add_project(elem, scope=scope, path_prefix="", source_label=context, context=context)
-            elif elem.tag == "remove-project":
-                _remove_project(elem, scope=scope, path_prefix="", context=context)

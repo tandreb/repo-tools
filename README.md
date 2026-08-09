@@ -69,6 +69,30 @@ einem Hinweis ab, statt zu raten; die betroffenen Werte können dann per
 | `--list-projects` | Gibt nur die aufgelöste Projektliste aus (Pfad, Name, Revision, URL, Herkunfts-Manifest) und beendet sich, ohne Remotes abzufragen |
 | `--verbose` | Debug-Logging |
 
+### Includes (`.inc`-Fragmente) und lokale Manifeste
+
+Die Auflösung folgt dem Zwei-Pass-Verfahren von `repo`
+(`XmlManifest._ParseManifestXml` / `_ParseManifest`): erst werden **alle** `<include>`s zu einer
+flachen Knotenliste zusammengezogen, danach werden die Knoten **nach Elementtyp** abgearbeitet —
+zuerst jedes `<remote>`, dann `<default>`, dann `<submanifest>`, dann `<project>`, und
+`<remove-project>` zuletzt.
+
+Die Reihenfolge der Elemente innerhalb einer Datei und über Dateien hinweg spielt damit keine
+Rolle. Genau darauf bauen in `.inc`-Fragmente zerlegte Manifeste auf: ein Fragment darf ein
+`<remote>` oder `<default>` benutzen, das erst in einer später eingebundenen Datei deklariert wird
+(oder unterhalb des `<include>`, das es hereingeholt hat), und ein `<remove-project>` greift auch
+auf Projekte, die ein nachfolgendes `<include>` beisteuert.
+
+Ein `<default>`, das nur einen Teil seiner Attribute setzt, ergänzt den bisherigen Stand, statt ihn
+zu ersetzen — ein Fragment, das lediglich eine Revision festnagelt, darf nicht das `remote`
+mitlöschen und damit sämtliche daran hängenden Projekte verlieren.
+
+Dateien unter `--local-manifest-dir` werden in dieselbe Knotenliste gemischt, ebenfalls wie bei
+`repo`. Sie können deshalb `<remote>`s des Hauptmanifests mitbenutzen, eigene `<include>`s
+auflösen (gesucht wird neben dem lokalen Manifest sowie in `../manifests/`) und per
+`<remove-project>` Projekte des Hauptmanifests entfernen. Relative `fetch`-URLs werden auch hier
+gegen die Manifest-URL aufgelöst.
+
 ### Submanifeste
 
 Die Auflösung folgt der Semantik von `repo` selbst (`_XmlSubmanifest.ToSubmanifestSpec`):
